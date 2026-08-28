@@ -1,0 +1,28 @@
+# ROS 2 / colcon generated directories
+build/
+install/
+log/
+
+# Test and Python caches
+.pytest_cache/
+**/.pytest_cache/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Runtime results and large generated sensor/model files
+results/
+*.bag
+*.db3
+*.mcap
+*.pt
+*.pth
+*.onnx
+*.mp4
+*.webm
+
+# Editor and operating-system files
+.vscode/
+.idea/
+*~
+.DS_Store

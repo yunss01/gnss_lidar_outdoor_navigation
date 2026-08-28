@@ -1,0 +1,69 @@
+<!--
+  Forward-only Ackermann NavigateThroughPoses tree.
+
+  bt_navigator prepares both NavigateToPose and NavigateThroughPoses during
+  lifecycle activation.  The Nav2 Humble default ThroughPoses tree requires a
+  Spin action server, which is deliberately unavailable on this car because it
+  cannot rotate in place.  This tree performs periodic replanning and path
+  following without unrealistic Spin recovery.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="3" name="NavigateAckermannRecovery">
+      <PipelineSequence name="NavigateThroughPosesWithAckermannReplanning">
+        <!--
+          Keep the 1 Hz replanning cadence that was stable in the completed
+          2026-08-18 runs.  At 0.333 Hz the car could drift far enough in the
+          three-second gap that a fresh forward-only Dubins solution selected
+          a large return arc.  Repeating that cycle made the vehicle orbit
+          instead of converging on the route.  Transient planner failures are
+          handled by the RecoveryNodes below, so lowering this rate is neither
+          necessary nor desirable.
+        -->
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">
+            <ReactiveSequence>
+              <!--
+                Match the bridge's maximum corner-passage radius.  Otherwise
+                pygame can advance to WP3 while Nav2 still keeps WP2 in this
+                action and replans a return path toward the already passed WP2.
+              -->
+              <RemovePassedGoals input_goals="{goals}" output_goals="{goals}"
+                radius="1.35" global_frame="odom" robot_base_frame="base_link"/>
+              <!--
+                Use Smac 2D for the rolling global route.  Hybrid/Dubins is a
+                good single-pose kinematic planner, but constraining every
+                manually recorded intermediate GNSS pose made otherwise open
+                routes exhaust the search before publishing their first path.
+                RPP remains the forward-only Ackermann controller, and the
+                path-validity and raw-LiDAR safety gates still reject paths or
+                commands that the real footprint cannot execute safely.
+              -->
+              <ComputePathThroughPoses goals="{goals}" path="{path}"
+                planner_id="GridBased"/>
+            </ReactiveSequence>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Context"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="AckermannRecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="AckermannRecoveryActions">
+          <Sequence name="ClearCostmaps">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree"
+              service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <Wait wait_duration="1"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

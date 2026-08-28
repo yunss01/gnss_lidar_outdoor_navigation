@@ -1,0 +1,16 @@
+<!--
+  Forward-only Ackermann navigation tree. It replans at 1 Hz but deliberately
+  omits Spin recovery because a car cannot rotate in place. A planning or
+  control failure therefore produces a stop for diagnosis instead of an
+  unrealistic manoeuvre.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <PipelineSequence name="NavigateWithAckermannReplanning">
+      <RateController hz="1.0">
+        <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+      </RateController>
+      <FollowPath path="{path}" controller_id="FollowPath"/>
+    </PipelineSequence>
+  </BehaviorTree>
+</root>

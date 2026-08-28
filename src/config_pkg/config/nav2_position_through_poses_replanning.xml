@@ -1,0 +1,44 @@
+<!--
+  Position-only rolling waypoint tree used by F9 OPEN ROUTE and F10 CLOSED LAP.
+
+  SmacPlanner2D plans through obstacle costs without imposing a terminal yaw
+  at every manually captured GNSS waypoint. The controller still follows the
+  resulting path with forward-only Ackermann commands.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="3" name="NavigatePositionRouteRecovery">
+      <PipelineSequence name="NavigateThroughPositionsWithReplanning">
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePositionPathThroughPoses">
+            <ReactiveSequence>
+              <RemovePassedGoals input_goals="{goals}" output_goals="{goals}"
+                radius="1.0" global_frame="odom" robot_base_frame="base_link"/>
+              <ComputePathThroughPoses goals="{goals}" path="{path}"
+                planner_id="PositionGrid"/>
+            </ReactiveSequence>
+            <ClearEntireCostmap name="ClearGlobalCostmap-PositionContext"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPositionPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-PositionContext"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="PositionRouteRecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="PositionRouteRecoveryActions">
+          <Sequence name="ClearPositionRouteCostmaps">
+            <ClearEntireCostmap name="ClearLocalCostmap-PositionRecovery"
+              service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-PositionRecovery"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <Wait wait_duration="1"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

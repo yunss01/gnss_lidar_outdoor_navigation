@@ -1,0 +1,37 @@
+# Human-authored WGS84 mission route.
+# Copy this file, replace the coordinates, and give the copied path to the
+# mission route loader. Names are for logs; navigation uses the coordinates.
+route_name: building_a_to_building_b
+coordinate_frame: wgs84
+
+# true repeats WP1 -> ... -> WPn -> WP1 until navigation is stopped.
+closed_loop: false
+
+# false loads the route without moving. The launch argument start_route:=true
+# can start it without editing this file.
+auto_start: false
+
+# Keep this true for the current mapless Nav2 two-target rolling horizon.
+rolling_horizon: true
+
+waypoints:
+  - name: building_a_exit
+    latitude: 37.000000
+    longitude: 127.000000
+    altitude: 0.0
+
+  - name: corner_1
+    latitude: 37.000100
+    longitude: 127.000100
+    altitude: 0.0
+
+  - name: building_b_entrance
+    latitude: 37.000200
+    longitude: 127.000200
+    altitude: 0.0
+
+# Reserved for the next development step. The loader validates these values,
+# but it currently publishes only the mission waypoints listed above.
+temporary_waypoints:
+  enabled: false
+  spacing_m: 25.0
