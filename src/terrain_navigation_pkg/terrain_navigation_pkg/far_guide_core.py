@@ -18,6 +18,50 @@ GridCell = Tuple[int, int]
 WorldPoint = Tuple[float, float]
 
 
+def select_direction_continuity(
+    retry_heading_rad,
+    leg_heading_rad,
+    retry_distance_m: float,
+    retry_cost_weight: float,
+    leg_distance_m: float,
+    leg_cost_weight: float,
+):
+    """Select the soft direction preference for the next online guide.
+
+    A short-lived retry heading represents immediate controller feedback and
+    therefore takes precedence.  Otherwise, keep the heading established by
+    the last successful segment of the current mission leg.  Returning a
+    *cost preference*, rather than a blocked corridor, lets A* change sides
+    when the remembered direction is genuinely obstructed.
+    """
+    candidates = (
+        (
+            retry_heading_rad,
+            float(retry_distance_m),
+            float(retry_cost_weight),
+            'retry',
+        ),
+        (
+            leg_heading_rad,
+            float(leg_distance_m),
+            float(leg_cost_weight),
+            'mission_leg',
+        ),
+    )
+    for heading, distance, weight, source in candidates:
+        if heading is None:
+            continue
+        values = float(heading), distance, weight
+        if not all(math.isfinite(value) for value in values):
+            continue
+        if distance < 0.0 or weight < 0.0:
+            raise ValueError(
+                'direction continuity parameters cannot be negative'
+            )
+        return values[0], distance, weight, source
+    return None, 0.0, 0.0, 'none'
+
+
 def bounded_heading_preference(
     reference_yaw_rad: float,
     preferred_yaw_rad: float,
@@ -142,6 +186,89 @@ def can_accept_length_only_detour(
         and assessment.inefficient
         and assessment.reasons == ('length_ratio',)
         and rejected >= minimum
+    )
+
+
+def can_accept_bounded_topology_escape(
+    assessment: PathEfficiencyAssessment,
+    previous_rejections: int,
+    minimum_previous_rejections: int,
+    already_used: bool,
+    maximum_length_ratio: float,
+    maximum_absolute_turn_rad: float,
+    maximum_signed_turn_rad: float,
+):
+    """Allow one bounded P-turn after ordinary Hybrid retries are exhausted.
+
+    A forward-only Ackermann vehicle can occasionally have only a wide
+    P-turn available.  Treating every path above the normal signed-turn limit
+    as a permanent failure caused the observed infinite hold.  This helper is
+    intentionally strict: the path must contain a topology violation, fit
+    within a second set of finite bounds, and may be accepted only once per
+    mission waypoint after the configured number of rejected alternatives.
+    """
+    rejected = int(previous_rejections)
+    minimum = int(minimum_previous_rejections)
+    limits = (
+        float(maximum_length_ratio),
+        float(maximum_absolute_turn_rad),
+        float(maximum_signed_turn_rad),
+    )
+    if rejected < 0 or minimum < 0:
+        raise ValueError('path rejection counts cannot be negative')
+    if any(not math.isfinite(value) or value <= 0.0 for value in limits):
+        raise ValueError('bounded topology escape limits must be positive')
+    if assessment is None or not assessment.inefficient or already_used:
+        return False
+    topology_failure = any(
+        reason in ('signed_loop', 'winding')
+        for reason in assessment.reasons
+    )
+    return (
+        topology_failure
+        and rejected >= minimum
+        and assessment.length_ratio <= limits[0]
+        and assessment.absolute_turn_rad <= limits[1]
+        and abs(assessment.signed_turn_rad) <= limits[2]
+    )
+
+
+def should_request_costmap_recovery(
+    abort_count: int,
+    minimum_abort_count: int,
+    speed_mps: float,
+    maximum_speed_mps: float,
+    path_hard_valid: bool,
+    path_validity_fresh: bool,
+    safety_state: str,
+    safety_state_fresh: bool,
+    cooldown_ready: bool,
+):
+    """Gate a small costmap clear using independent safety evidence.
+
+    The recovery is for transient lethal/inscribed cells around a stationary
+    vehicle, not for bypassing a real obstacle.  It is therefore permitted
+    only after repeated action aborts while both the raw-LiDAR safety state
+    and the separately evaluated path report clear/fresh evidence.
+    """
+    aborts = int(abort_count)
+    threshold = int(minimum_abort_count)
+    speed = float(speed_mps)
+    maximum_speed = float(maximum_speed_mps)
+    if aborts < 0 or threshold < 1:
+        raise ValueError('costmap recovery abort counts are invalid')
+    if not math.isfinite(speed) or not math.isfinite(maximum_speed):
+        return False
+    if maximum_speed < 0.0:
+        raise ValueError('costmap recovery speed cannot be negative')
+    return (
+        aborts >= threshold
+        and abs(speed) <= maximum_speed
+        and bool(path_hard_valid)
+        and bool(path_validity_fresh)
+        and str(safety_state) == 'clear'
+        and bool(safety_state_fresh)
+        and bool(cooldown_ready)
     )
 
 
@@ -1071,15 +1198,21 @@ def plan_online_guide(
     )
     if goal_cell is None:
         return None
-    goal_was_clipped = math.hypot(
-        clipped_goal[0] - goal_world[0], clipped_goal[1] - goal_world[1]
-    ) >= planning_grid.resolution_m
-    frontier_margin_cells = (
-        max(1, int(math.ceil(
-            boundary_margin_m / planning_grid.resolution_m
-        )))
-        if goal_was_clipped else 0
-    )
+    # The exact goal can lie inside a rolling costmap while still belonging
+    # to a free-space component that is not connected to the vehicle.  This
+    # happens in mapless navigation when a building/wall divides the current
+    # observation: the far side is represented in the costmap, but the route
+    # around the end has not been revealed yet.  Trying only the exact goal in
+    # that case leaves the vehicle in ``guide_not_found`` forever.
+    #
+    # Always make the reachable-frontier fallback available.  A* still tries
+    # the exact (possibly clipped) goal first, so connected F9/F10 routes are
+    # unchanged.  The frontier is used only after exact-goal search fails and
+    # only when the vehicle's free component actually reaches the rolling-map
+    # boundary by at least the configured minimum progress.
+    frontier_margin_cells = max(1, int(math.ceil(
+        boundary_margin_m / planning_grid.resolution_m
+    )))
     dense = astar_grid_path(
         planning_grid,
         start_cell,

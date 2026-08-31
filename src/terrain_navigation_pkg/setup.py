@@ -15,7 +15,10 @@ setup(
         ),
         (
             'share/' + package_name,
-            ['package.xml', 'README.md', 'PLANNING_DESIGN.md'],
+            [
+                'package.xml', 'README.md', 'PLANNING_DESIGN.md',
+                'EVALUATION.md',
+            ],
         ),
     ],
     install_requires=['setuptools'],
@@ -55,6 +58,8 @@ setup(
             'terrain_navigation_pkg.far_nav2_guide_node:main',
             'navigation_learning_recorder_node = '
             'terrain_navigation_pkg.navigation_learning_recorder_node:main',
+            'evaluate_navigation_runs = '
+            'terrain_navigation_pkg.evaluate_navigation_runs:main',
         ],
     },
 )

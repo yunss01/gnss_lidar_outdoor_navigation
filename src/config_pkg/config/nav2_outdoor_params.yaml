@@ -140,6 +140,10 @@ local_costmap:
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
+        # Remove stale marked cells underneath the current footprint. Genuine
+        # surrounding obstacles remain in the layer and the raw-LiDAR safety
+        # node can still stop the vehicle independently.
+        footprint_clearing_enabled: true
         # Points are filtered in the LiDAR frame before this layer, but after
         # TF conversion their Z is the absolute odom altitude (about 78 m in
         # Mine_01).  The Nav2 default 2 m ceiling would discard every point.
@@ -203,6 +207,7 @@ global_costmap:
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
+        footprint_clearing_enabled: true
         # Keep the layer-level gate wider than every CARLA map altitude. The
         # sensor-relative ground/sky band is already enforced by the filter.
         min_obstacle_height: -1000.0

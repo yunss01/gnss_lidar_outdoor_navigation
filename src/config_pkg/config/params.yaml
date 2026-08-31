@@ -94,7 +94,10 @@ navigation_learning_recorder_node:
     maximum_cloud_age_s: 0.7
     maximum_odometry_age_s: 0.7
     writer_queue_size: 64
-    save_raw_points: true
+    # Paper evaluation keeps only lightweight CSV/JSON. Set both true again
+    # only when collecting BEV tensors for future imitation learning.
+    save_sample_files: false
+    save_raw_points: false
     # Vehicle-centric BEV: x forward, y left. Row 0 is the far-forward edge.
     bev_x_min_m: -10.0
     bev_x_max_m: 30.0
@@ -125,6 +128,7 @@ navigation_learning_recorder_node:
     path_clearance_status_topic: /navigation/path_clearance/status
     nav2_status_topic: /navigation/nav2_status
     far_guide_status_topic: /navigation/far_guide_status
+    collision_topic: /vehicle/collision
 nav2_goal_bridge_node:
   ros__parameters:
     goal_local_topic: /navigation/goal_local
@@ -203,6 +207,14 @@ far_nav2_guide_node:
     retry_direction_hold_s: 12.0
     retry_direction_distance_m: 8.0
     retry_direction_cost_weight: 0.8
+    # 정상 완료한 12 m 세그먼트의 진행 방향을 현재 mission WP가 끝날
+    # 때까지 이어받는다. rolling costmap의 몇 개 셀 차이만으로 다음
+    # 세그먼트가 반대 통로/P-turn으로 뒤집히는 현상을 억제한다.
+    # hard block이 아닌 soft cost이므로 기존 통로가 실제로 막히면 A*는
+    # 반대 통로를 선택할 수 있다. 실패 직후에는 위 retry 설정이 우선한다.
+    leg_direction_continuity_enabled: true
+    leg_direction_distance_m: 12.0
+    leg_direction_cost_weight: 2.0
     # RPP가 충돌 예측으로 ABORT한 실제 12 m 행동 구간을 FAR에 되먹임한다.
     # 먼저 1.5 m 폭의 비용으로 다른 통로를 선호하게 하고, 동일 경로가
     # 다시 나오면 중심 0.75 m를 임시 차단해 다른 homotopy를 강제한다.
@@ -264,6 +276,27 @@ far_nav2_guide_node:
     path_efficiency_blocked_retry_s: 5.0
     path_efficiency_escape_lookahead_m: 12.0
     path_efficiency_escape_max_yaw_change_deg: 35.0
+    # If all six normal forward-only retries produce the same topology, allow
+    # one bounded P-turn for this waypoint. This addresses the second failed
+    # evaluation run without reopening unlimited circles: a >350 deg path,
+    # >3.1x detour, or a second P-turn remains rejected.
+    path_efficiency_allow_bounded_topology_escape: true
+    path_efficiency_topology_escape_after_retries: 6
+    path_efficiency_topology_escape_max_length_ratio: 3.1
+    path_efficiency_topology_escape_max_abs_turn_deg: 350.0
+    path_efficiency_topology_escape_max_signed_turn_deg: 330.0
+    # After two controller aborts, clear only the rolling-map neighborhood
+    # around a stationary vehicle, and only when both the independent path
+    # gate and raw-LiDAR emergency state are fresh and clear.
+    stuck_costmap_recovery_enabled: true
+    stuck_costmap_recovery_abort_count: 2
+    stuck_costmap_recovery_reset_distance_m: 3.0
+    stuck_costmap_recovery_max_speed_mps: 0.1
+    stuck_costmap_recovery_cooldown_s: 10.0
+    safety_state_topic: /safety/state
+    safety_state_timeout_s: 1.5
+    local_costmap_clear_service: /local_costmap/clear_around_local_costmap
+    global_costmap_clear_service: /global_costmap/clear_around_global_costmap
     # The Nav2 map is 0.25 m/cell. A stride of 2 gives a 0.5 m guide grid,
     # which is inexpensive but still finer than the full-size vehicle.
     grid_stride: 2

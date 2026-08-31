@@ -9,7 +9,9 @@ from terrain_navigation_pkg.far_guide_core import assess_active_replan
 from terrain_navigation_pkg.far_guide_core import add_direction_continuity_cost
 from terrain_navigation_pkg.far_guide_core import add_failed_corridor_cost
 from terrain_navigation_pkg.far_guide_core import bounded_heading_preference
+from terrain_navigation_pkg.far_guide_core import can_accept_bounded_topology_escape
 from terrain_navigation_pkg.far_guide_core import can_accept_length_only_detour
+from terrain_navigation_pkg.far_guide_core import PathEfficiencyAssessment
 from terrain_navigation_pkg.far_guide_core import line_of_sight
 from terrain_navigation_pkg.far_guide_core import nearest_polyline_tangent
 from terrain_navigation_pkg.far_guide_core import plan_online_guide
@@ -17,7 +19,9 @@ from terrain_navigation_pkg.far_guide_core import polylines_similar
 from terrain_navigation_pkg.far_guide_core import prefix_polyline_to_point
 from terrain_navigation_pkg.far_guide_core import remaining_polyline_length
 from terrain_navigation_pkg.far_guide_core import retry_lookahead_distance
+from terrain_navigation_pkg.far_guide_core import select_direction_continuity
 from terrain_navigation_pkg.far_guide_core import select_subgoal
+from terrain_navigation_pkg.far_guide_core import should_request_costmap_recovery
 
 
 def _grid(occupancy, resolution=1.0, stride=1):
@@ -186,7 +190,7 @@ def test_distant_disconnected_goal_advances_to_reachable_frontier():
     ) >= 2.0
 
 
-def test_inside_grid_disconnected_goal_does_not_use_frontier_fallback():
+def test_inside_grid_disconnected_goal_advances_to_reachable_frontier():
     occupancy = np.zeros((30, 30), dtype=np.float32)
     occupancy[14:16, :] = 100.0
     grid = _grid(occupancy)
@@ -201,7 +205,15 @@ def test_inside_grid_disconnected_goal_does_not_use_frontier_fallback():
         maximum_expansions=20000,
     )
 
-    assert path is None
+    assert path is not None
+    assert len(path) >= 2
+    endpoint = grid.world_to_cell(path[-1])
+    assert endpoint[0] <= 2 or endpoint[0] >= grid.width - 3
+    assert endpoint[1] < 14
+    assert grid.world_to_cell(path[-1]) != grid.world_to_cell((15.5, 22.5))
+    assert math.hypot(
+        path[-1][0] - path[0][0], path[-1][1] - path[0][1]
+    ) >= 2.0
 
 
 def test_subgoal_interpolates_at_requested_lookahead():
@@ -296,7 +308,11 @@ def test_start_release_never_opens_a_truly_lethal_wall():
         maximum_expansions=10000,
     )
 
-    assert path is None
+    # The mapless frontier fallback may advance along the reachable side of
+    # the wall, but it must never cross the truly lethal column to the goal.
+    assert path is not None
+    assert all(point[0] < 6.0 for point in path)
+    assert path[-1] != (10.5, 7.5)
 
 
 def test_remaining_length_projects_vehicle_onto_old_guide():
@@ -369,6 +385,45 @@ def test_direction_preference_does_not_forbid_required_opposite_route():
 
     assert path is not None
     assert path[-1] == (2.5, 10.5)
+
+
+def test_successful_mission_leg_direction_is_used_without_a_retry():
+    preference = select_direction_continuity(
+        retry_heading_rad=None,
+        leg_heading_rad=0.7,
+        retry_distance_m=8.0,
+        retry_cost_weight=0.8,
+        leg_distance_m=12.0,
+        leg_cost_weight=2.0,
+    )
+
+    assert preference == (0.7, 12.0, 2.0, 'mission_leg')
+
+
+def test_immediate_retry_direction_overrides_mission_leg_direction():
+    preference = select_direction_continuity(
+        retry_heading_rad=-0.4,
+        leg_heading_rad=0.7,
+        retry_distance_m=8.0,
+        retry_cost_weight=0.8,
+        leg_distance_m=12.0,
+        leg_cost_weight=2.0,
+    )
+
+    assert preference == (-0.4, 8.0, 0.8, 'retry')
+
+
+def test_direction_continuity_is_empty_before_the_first_segment():
+    preference = select_direction_continuity(
+        retry_heading_rad=None,
+        leg_heading_rad=None,
+        retry_distance_m=8.0,
+        retry_cost_weight=0.8,
+        leg_distance_m=12.0,
+        leg_cost_weight=2.0,
+    )
+
+    assert preference == (None, 0.0, 0.0, 'none')
 
 
 def test_failed_corridor_soft_cost_penalizes_center_without_blocking_it():
@@ -586,6 +641,78 @@ def test_signed_loop_is_never_accepted_as_length_only_detour():
     assert assessment is not None
     assert 'signed_loop' in assessment.reasons
     assert not can_accept_length_only_detour(assessment, 10, 1)
+
+
+def test_one_bounded_p_turn_is_accepted_only_after_retries():
+    assessment = PathEfficiencyAssessment(
+        path_length_m=28.0,
+        reference_length_m=10.0,
+        length_ratio=2.8,
+        absolute_turn_rad=math.radians(325.0),
+        signed_turn_rad=math.radians(320.0),
+        inefficient=True,
+        reasons=('length_ratio', 'signed_loop'),
+    )
+    limits = dict(
+        minimum_previous_rejections=6,
+        maximum_length_ratio=3.1,
+        maximum_absolute_turn_rad=math.radians(350.0),
+        maximum_signed_turn_rad=math.radians(330.0),
+    )
+    assert not can_accept_bounded_topology_escape(
+        assessment, previous_rejections=5, already_used=False, **limits
+    )
+    assert can_accept_bounded_topology_escape(
+        assessment, previous_rejections=6, already_used=False, **limits
+    )
+    assert not can_accept_bounded_topology_escape(
+        assessment, previous_rejections=6, already_used=True, **limits
+    )
+
+
+def test_excessive_winding_is_not_a_bounded_p_turn_escape():
+    assessment = PathEfficiencyAssessment(
+        path_length_m=30.0,
+        reference_length_m=10.0,
+        length_ratio=3.0,
+        absolute_turn_rad=math.radians(390.0),
+        signed_turn_rad=math.radians(370.0),
+        inefficient=True,
+        reasons=('length_ratio', 'winding', 'signed_loop'),
+    )
+    assert not can_accept_bounded_topology_escape(
+        assessment,
+        previous_rejections=6,
+        minimum_previous_rejections=6,
+        already_used=False,
+        maximum_length_ratio=3.1,
+        maximum_absolute_turn_rad=math.radians(350.0),
+        maximum_signed_turn_rad=math.radians(330.0),
+    )
+
+
+def test_costmap_recovery_requires_all_independent_clear_signals():
+    arguments = dict(
+        abort_count=2,
+        minimum_abort_count=2,
+        speed_mps=0.01,
+        maximum_speed_mps=0.10,
+        path_hard_valid=True,
+        path_validity_fresh=True,
+        safety_state='clear',
+        safety_state_fresh=True,
+        cooldown_ready=True,
+    )
+    assert should_request_costmap_recovery(**arguments)
+    assert not should_request_costmap_recovery(
+        **dict(arguments, safety_state='obstacle_stop')
+    )
+    assert not should_request_costmap_recovery(
+        **dict(arguments, path_validity_fresh=False)
+    )
+    assert not should_request_costmap_recovery(
+        **dict(arguments, speed_mps=0.5)
+    )
 
 
 def test_path_efficiency_uses_far_reference_not_blocked_direct_distance():

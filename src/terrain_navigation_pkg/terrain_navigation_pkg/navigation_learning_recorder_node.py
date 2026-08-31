@@ -30,7 +30,7 @@ from rclpy.qos import (
 )
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
-from std_msgs.msg import Bool, String, UInt32
+from std_msgs.msg import Bool, Float32, String, UInt32
 
 from .navigation_learning_recorder_core import (
     BevGeometry,
@@ -51,6 +51,7 @@ CSV_FIELDS = [
     'safety_state', 'safety_obstacle_points', 'path_hard_valid',
     'nav2_status', 'far_guide_status', 'path_clearance_status',
     'nav2_plan_points', 'far_guide_points', 'raw_lidar_points',
+    'collision_event_count', 'collision_max_intensity',
 ]
 
 
@@ -88,6 +89,9 @@ class NavigationLearningRecorder(Node):
         self.save_raw_points = bool(
             self.get_parameter('save_raw_points').value
         )
+        self.save_sample_files = bool(
+            self.get_parameter('save_sample_files').value
+        )
         self.geometry = BevGeometry(
             x_min_m=float(self.get_parameter('bev_x_min_m').value),
             x_max_m=float(self.get_parameter('bev_x_max_m').value),
@@ -110,6 +114,8 @@ class NavigationLearningRecorder(Node):
         self._last_cloud_key = None
         self._queued_samples = 0
         self._dropped_samples = 0
+        self._collision_event_count = 0
+        self._collision_max_intensity = 0.0
 
         queue_size = int(self.get_parameter('writer_queue_size').value)
         self._writer_queue = queue.Queue(maxsize=max(4, queue_size))
@@ -143,6 +149,7 @@ class NavigationLearningRecorder(Node):
             'maximum_odometry_age_s': 0.7,
             'writer_queue_size': 64,
             'save_raw_points': True,
+            'save_sample_files': True,
             'bev_x_min_m': -10.0,
             'bev_x_max_m': 30.0,
             'bev_y_min_m': -20.0,
@@ -172,6 +179,7 @@ class NavigationLearningRecorder(Node):
             'path_clearance_status_topic': '/navigation/path_clearance/status',
             'nav2_status_topic': '/navigation/nav2_status',
             'far_guide_status_topic': '/navigation/far_guide_status',
+            'collision_topic': '/vehicle/collision',
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -213,6 +221,9 @@ class NavigationLearningRecorder(Node):
         self.create_subscription(
             UInt32, topic('route_size_topic'), self._on_route_size, latched
         )
+        self.create_subscription(
+            Float32, topic('collision_topic'), self._on_collision, reliable
+        )
         for message_type, parameter, key, qos in [
             (PointStamped, 'goal_local_topic', 'goal_local', latched),
             (PointStamped, 'current_local_topic', 'current_local', latched),
@@ -253,6 +264,17 @@ class NavigationLearningRecorder(Node):
         with self._lock:
             self._route_size = int(message.data)
 
+    def _on_collision(self, message):
+        intensity = max(0.0, float(message.data))
+        if intensity <= 0.0:
+            return
+        with self._lock:
+            if self._active_session is not None:
+                self._collision_event_count += 1
+                self._collision_max_intensity = max(
+                    self._collision_max_intensity, intensity
+                )
+
     def _on_route_status(self, message):
         status = message.data.strip().lower()
         with self._lock:
@@ -284,13 +306,18 @@ class NavigationLearningRecorder(Node):
             self._last_cloud_key = None
             self._queued_samples = 0
             self._dropped_samples = 0
+            self._collision_event_count = 0
+            self._collision_max_intensity = 0.0
             route_json = self._route_json
             route_size = self._route_size
         metadata = {
             'schema_version': 1,
             'session': session_name,
             'started_at': now.isoformat(),
-            'purpose': 'local-navigation policy learning',
+            'purpose': (
+                'local-navigation policy learning' if self.save_sample_files
+                else 'navigation performance evaluation'
+            ),
             'control_effect': 'none; subscriber-only recorder',
             'route_json': route_json,
             'route_size': route_size,
@@ -327,6 +354,8 @@ class NavigationLearningRecorder(Node):
                 'route_json': self._route_json,
                 'queued_samples': self._queued_samples,
                 'dropped_samples': self._dropped_samples,
+                'collision_event_count': self._collision_event_count,
+                'collision_max_intensity': self._collision_max_intensity,
                 'ended_at': datetime.now(timezone.utc).astimezone().isoformat(),
             }
             self._active_session = None
@@ -379,6 +408,8 @@ class NavigationLearningRecorder(Node):
                 'route_size': self._route_size,
                 'route_json': self._route_json,
                 'snapshot_wall': snapshot_wall,
+                'collision_event_count': self._collision_event_count,
+                'collision_max_intensity': self._collision_max_intensity,
             }
         try:
             self._writer_queue.put_nowait(('sample', snapshot, context))
@@ -454,7 +485,9 @@ class NavigationLearningRecorder(Node):
             & (points[:, 2] <= self.geometry.z_max_m)
         )
         points = points[keep].astype(np.float32, copy=False)
-        lidar_bev = build_lidar_bev(points, self.geometry)
+        lidar_bev = None
+        if self.save_sample_files:
+            lidar_bev = build_lidar_bev(points, self.geometry)
 
         position = odom.pose.pose.position
         orientation = odom.pose.pose.orientation
@@ -464,12 +497,14 @@ class NavigationLearningRecorder(Node):
         pose = (position.x, position.y, position.z, yaw)
         plan = self._path_vehicle(snapshot.get('nav2_plan'), pose)
         guide = self._path_vehicle(snapshot.get('far_guide_path'), pose)
-        local_costmap = self._costmap_vehicle(
-            snapshot.get('local_costmap'), pose
-        )
-        global_costmap = self._costmap_vehicle(
-            snapshot.get('global_costmap'), pose
-        )
+        local_costmap = global_costmap = None
+        if self.save_sample_files:
+            local_costmap = self._costmap_vehicle(
+                snapshot.get('local_costmap'), pose
+            )
+            global_costmap = self._costmap_vehicle(
+                snapshot.get('global_costmap'), pose
+            )
 
         goal = np.full(3, np.nan, dtype=np.float32)
         vector = snapshot.get('goal_vector')
@@ -504,7 +539,10 @@ class NavigationLearningRecorder(Node):
         sample_name = 'sample_%06d.npz' % context['sample_id']
         sample_path = context['session'] / 'samples' / sample_name
         arrays = {
-            'lidar_bev': lidar_bev.astype(np.float16),
+            'lidar_bev': (
+                lidar_bev.astype(np.float16) if lidar_bev is not None
+                else np.empty((0,), dtype=np.float16)
+            ),
             'lidar_points_xyz': (
                 points if self.save_raw_points
                 else np.empty((0, 3), dtype=np.float32)
@@ -527,7 +565,8 @@ class NavigationLearningRecorder(Node):
                 output_command.linear.x, output_command.angular.z
             ], dtype=np.float32),
         }
-        np.savez_compressed(sample_path, **arrays)
+        if self.save_sample_files:
+            np.savez_compressed(sample_path, **arrays)
         speed = math.sqrt(
             twist.linear.x ** 2 + twist.linear.y ** 2 + twist.linear.z ** 2
         )
@@ -543,7 +582,7 @@ class NavigationLearningRecorder(Node):
             'cloud_stamp_s': '%.9f' % _stamp_seconds(cloud.header.stamp),
             'cloud_age_s': '%.4f' % context['cloud_age_s'],
             'odom_age_s': '%.4f' % context['odom_age_s'],
-            'file': 'samples/' + sample_name,
+            'file': ('samples/' + sample_name) if self.save_sample_files else '',
             'route_status': context['route_status'],
             'route_index': context['route_index'],
             'route_size': context['route_size'],
@@ -574,6 +613,10 @@ class NavigationLearningRecorder(Node):
             'nav2_plan_points': int(plan.shape[0]),
             'far_guide_points': int(guide.shape[0]),
             'raw_lidar_points': int(points.shape[0]),
+            'collision_event_count': context['collision_event_count'],
+            'collision_max_intensity': '%.5f' % context[
+                'collision_max_intensity'
+            ],
         }
         return row
 
@@ -587,7 +630,9 @@ class NavigationLearningRecorder(Node):
                 action = item[0]
                 if action == 'start':
                     _, path, metadata = item
-                    (path / 'samples').mkdir(parents=True, exist_ok=True)
+                    path.mkdir(parents=True, exist_ok=True)
+                    if self.save_sample_files:
+                        (path / 'samples').mkdir(parents=True, exist_ok=True)
                     _json_write(path / 'metadata.json', metadata)
                     stream = (path / 'frames.csv').open(
                         'w', newline='', encoding='utf-8'

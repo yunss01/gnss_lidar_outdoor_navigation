@@ -8,6 +8,7 @@ import time
 
 from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.srv import ClearCostmapAroundRobot
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as PathMessage
 import numpy as np
 import rclpy
@@ -21,6 +22,7 @@ from .far_guide_core import build_guide_grid
 from .far_guide_core import assess_path_efficiency
 from .far_guide_core import assess_active_replan
 from .far_guide_core import bounded_heading_preference
+from .far_guide_core import can_accept_bounded_topology_escape
 from .far_guide_core import can_accept_length_only_detour
 from .far_guide_core import nearest_polyline_tangent
 from .far_guide_core import plan_online_guide
@@ -28,7 +30,9 @@ from .far_guide_core import polylines_similar
 from .far_guide_core import prefix_polyline_to_point
 from .far_guide_core import remaining_polyline_length
 from .far_guide_core import retry_lookahead_distance
+from .far_guide_core import select_direction_continuity
 from .far_guide_core import select_subgoal
+from .far_guide_core import should_request_costmap_recovery
 
 
 class FarNav2GuideNode(Node):
@@ -72,6 +76,13 @@ class FarNav2GuideNode(Node):
         self.declare_parameter('retry_direction_hold_s', 12.0)
         self.declare_parameter('retry_direction_distance_m', 8.0)
         self.declare_parameter('retry_direction_cost_weight', 0.8)
+        # A successful 12 m segment is stronger evidence than a single noisy
+        # rolling-grid snapshot. Preserve that segment's departure direction
+        # for the rest of the current mission waypoint so adjacent replans do
+        # not arbitrarily switch to the opposite homotopy.
+        self.declare_parameter('leg_direction_continuity_enabled', True)
+        self.declare_parameter('leg_direction_distance_m', 12.0)
+        self.declare_parameter('leg_direction_cost_weight', 2.0)
         # Controller feedback closes a gap the coarse guide cannot predict:
         # RPP may cut inside a valid guide and collide. Remember that executed
         # prefix briefly, penalize it, and hard-block it only when a duplicate
@@ -129,6 +140,42 @@ class FarNav2GuideNode(Node):
         self.declare_parameter(
             'path_efficiency_escape_max_yaw_change_deg', 35.0
         )
+        self.declare_parameter(
+            'path_efficiency_allow_bounded_topology_escape', True
+        )
+        self.declare_parameter(
+            'path_efficiency_topology_escape_after_retries', 6
+        )
+        self.declare_parameter(
+            'path_efficiency_topology_escape_max_length_ratio', 3.1
+        )
+        self.declare_parameter(
+            'path_efficiency_topology_escape_max_abs_turn_deg', 350.0
+        )
+        self.declare_parameter(
+            'path_efficiency_topology_escape_max_signed_turn_deg', 330.0
+        )
+        # A repeated controller abort can leave a transient lethal cell under
+        # the vehicle in the rolling costmap. Clear only a small neighborhood,
+        # and only while two independent safety checks report a fresh clear
+        # state. This never bypasses the raw-LiDAR emergency stop.
+        self.declare_parameter('stuck_costmap_recovery_enabled', True)
+        self.declare_parameter('stuck_costmap_recovery_abort_count', 2)
+        self.declare_parameter(
+            'stuck_costmap_recovery_reset_distance_m', 3.0
+        )
+        self.declare_parameter('stuck_costmap_recovery_max_speed_mps', 0.1)
+        self.declare_parameter('stuck_costmap_recovery_cooldown_s', 10.0)
+        self.declare_parameter('safety_state_topic', '/safety/state')
+        self.declare_parameter('safety_state_timeout_s', 1.5)
+        self.declare_parameter(
+            'local_costmap_clear_service',
+            '/local_costmap/clear_around_local_costmap',
+        )
+        self.declare_parameter(
+            'global_costmap_clear_service',
+            '/global_costmap/clear_around_global_costmap',
+        )
         self.declare_parameter('grid_stride', 2)
         self.declare_parameter('lethal_cost_threshold', 99.0)
         self.declare_parameter('unknown_cost', 0.15)
@@ -182,6 +229,15 @@ class FarNav2GuideNode(Node):
         )
         self.retry_direction_cost_weight = float(
             self.get_parameter('retry_direction_cost_weight').value
+        )
+        self.leg_direction_continuity_enabled = bool(
+            self.get_parameter('leg_direction_continuity_enabled').value
+        )
+        self.leg_direction_distance_m = float(
+            self.get_parameter('leg_direction_distance_m').value
+        )
+        self.leg_direction_cost_weight = float(
+            self.get_parameter('leg_direction_cost_weight').value
         )
         self.failed_corridor_enabled = bool(
             self.get_parameter('failed_corridor_enabled').value
@@ -299,6 +355,53 @@ class FarNav2GuideNode(Node):
                 'path_efficiency_escape_max_yaw_change_deg'
             ).value
         ))
+        self.path_efficiency_allow_bounded_topology_escape = bool(
+            self.get_parameter(
+                'path_efficiency_allow_bounded_topology_escape'
+            ).value
+        )
+        self.path_efficiency_topology_escape_after_retries = int(
+            self.get_parameter(
+                'path_efficiency_topology_escape_after_retries'
+            ).value
+        )
+        self.path_efficiency_topology_escape_max_length_ratio = float(
+            self.get_parameter(
+                'path_efficiency_topology_escape_max_length_ratio'
+            ).value
+        )
+        self.path_efficiency_topology_escape_max_abs_turn_rad = math.radians(
+            float(self.get_parameter(
+                'path_efficiency_topology_escape_max_abs_turn_deg'
+            ).value)
+        )
+        self.path_efficiency_topology_escape_max_signed_turn_rad = (
+            math.radians(float(self.get_parameter(
+                'path_efficiency_topology_escape_max_signed_turn_deg'
+            ).value))
+        )
+        self.stuck_costmap_recovery_enabled = bool(
+            self.get_parameter('stuck_costmap_recovery_enabled').value
+        )
+        self.stuck_costmap_recovery_abort_count = int(
+            self.get_parameter('stuck_costmap_recovery_abort_count').value
+        )
+        self.stuck_costmap_recovery_reset_distance_m = float(
+            self.get_parameter(
+                'stuck_costmap_recovery_reset_distance_m'
+            ).value
+        )
+        self.stuck_costmap_recovery_max_speed_mps = float(
+            self.get_parameter(
+                'stuck_costmap_recovery_max_speed_mps'
+            ).value
+        )
+        self.stuck_costmap_recovery_cooldown_s = float(
+            self.get_parameter('stuck_costmap_recovery_cooldown_s').value
+        )
+        self.safety_state_timeout_s = float(
+            self.get_parameter('safety_state_timeout_s').value
+        )
         self.grid_stride = int(self.get_parameter('grid_stride').value)
         self.lethal_cost_threshold = float(
             self.get_parameter('lethal_cost_threshold').value
@@ -337,6 +440,13 @@ class FarNav2GuideNode(Node):
             self.retry_direction_cost_weight,
         ) < 0.0:
             raise ValueError('retry direction parameters cannot be negative')
+        if min(
+            self.leg_direction_distance_m,
+            self.leg_direction_cost_weight,
+        ) < 0.0:
+            raise ValueError(
+                'mission-leg direction parameters cannot be negative'
+            )
         if min(
             self.failed_corridor_hold_s,
             self.failed_corridor_radius_m,
@@ -394,6 +504,26 @@ class FarNav2GuideNode(Node):
             raise ValueError(
                 'length-only detour retry threshold cannot be negative'
             )
+        if self.path_efficiency_topology_escape_after_retries < 1:
+            raise ValueError('topology escape retry threshold must be positive')
+        if min(
+            self.path_efficiency_topology_escape_max_length_ratio,
+            self.path_efficiency_topology_escape_max_abs_turn_rad,
+            self.path_efficiency_topology_escape_max_signed_turn_rad,
+        ) <= 0.0:
+            raise ValueError('topology escape limits must be positive')
+        if self.stuck_costmap_recovery_abort_count < 1:
+            raise ValueError('costmap recovery abort count must be positive')
+        if min(
+            self.stuck_costmap_recovery_reset_distance_m,
+            self.stuck_costmap_recovery_max_speed_mps,
+            self.stuck_costmap_recovery_cooldown_s,
+        ) < 0.0:
+            raise ValueError('costmap recovery parameters cannot be negative')
+        if self.stuck_costmap_recovery_reset_distance_m <= 0.0:
+            raise ValueError('costmap recovery distance must be positive')
+        if self.safety_state_timeout_s <= 0.0:
+            raise ValueError('safety state timeout must be positive')
         if not (
             0.0 < self.path_efficiency_retry_min_lookahead_m
             <= self.segment_lookahead_m
@@ -484,6 +614,12 @@ class FarNav2GuideNode(Node):
             reliable_qos,
         )
         self.create_subscription(
+            String,
+            str(self.get_parameter('safety_state_topic').value),
+            self._on_safety_state,
+            reliable_qos,
+        )
+        self.create_subscription(
             PathMessage,
             str(self.get_parameter('nav2_plan_topic').value),
             self._on_nav2_plan,
@@ -493,6 +629,14 @@ class FarNav2GuideNode(Node):
             self,
             NavigateToPose,
             str(self.get_parameter('action_name').value),
+        )
+        self.local_costmap_clear_client = self.create_client(
+            ClearCostmapAroundRobot,
+            str(self.get_parameter('local_costmap_clear_service').value),
+        )
+        self.global_costmap_clear_client = self.create_client(
+            ClearCostmapAroundRobot,
+            str(self.get_parameter('global_costmap_clear_service').value),
         )
 
         self.latest_costmap = None
@@ -518,18 +662,25 @@ class FarNav2GuideNode(Node):
         self.last_subgoal_xy = None
         self.latest_path_hard_valid = None
         self.latest_path_validity_wall_time = None
+        self.latest_safety_state = None
+        self.latest_safety_state_wall_time = None
         self.pending_replan_reason = None
         self.pending_replan_subgoal_xy = None
         self.pending_replan_count = 0
         self.retry_direction_heading_rad = None
         self.retry_direction_until_wall_time = 0.0
+        self.leg_direction_heading_rad = None
         self.failed_corridors = []
         self.canceled_goal_handles = []
         self.path_efficiency_retry_count = 0
         self.relaxed_subgoal_yaw_until_wall_time = 0.0
         self.path_efficiency_blocked_until_wall_time = 0.0
         self.path_efficiency_escape_mode = False
+        self.path_efficiency_topology_escape_used = False
         self.active_inefficient_plan_signatures = set()
+        self.consecutive_segment_aborts = 0
+        self.last_costmap_recovery_wall_time = float('-inf')
+        self.costmap_recovery_pending = 0
         self.log_stream, self.log_writer = self._create_logger(
             str(self.get_parameter('log_directory').value)
         )
@@ -660,8 +811,10 @@ class FarNav2GuideNode(Node):
         self.hold_until_wall_time = 0.0
         self.last_subgoal_xy = None
         self._clear_retry_direction()
+        self._clear_leg_direction()
         self._clear_failed_corridors()
-        self._reset_path_efficiency_retry()
+        self._reset_path_efficiency_retry(reset_topology_escape=True)
+        self.consecutive_segment_aborts = 0
         tangent_status = 'tangent=undefined'
         if self.latest_goal_tangent_yaw_rad is not None:
             tangent_status = 'tangent={:.1f}deg;index={}'.format(
@@ -678,8 +831,11 @@ class FarNav2GuideNode(Node):
         self.goal_reached = reached
         if not reached:
             return
+        self._clear_retry_direction()
+        self._clear_leg_direction()
         self._clear_failed_corridors()
-        self._reset_path_efficiency_retry()
+        self._reset_path_efficiency_retry(reset_topology_escape=True)
+        self.consecutive_segment_aborts = 0
         self._publish_status('mission_waypoint_reached')
         self._log('mission_waypoint_reached')
         self._cancel_active_goal('mission_waypoint_reached')
@@ -688,12 +844,118 @@ class FarNav2GuideNode(Node):
         self.latest_path_hard_valid = bool(message.data)
         self.latest_path_validity_wall_time = time.monotonic()
 
-    def _reset_path_efficiency_retry(self):
+    def _on_safety_state(self, message):
+        self.latest_safety_state = str(message.data)
+        self.latest_safety_state_wall_time = time.monotonic()
+
+    def _vehicle_speed_mps(self):
+        if self.latest_odometry is None:
+            return float('inf')
+        velocity = self.latest_odometry.twist.twist.linear
+        return math.hypot(float(velocity.x), float(velocity.y))
+
+    def _costmap_recovery_complete(self, future, layer):
+        self.costmap_recovery_pending = max(
+            0, self.costmap_recovery_pending - 1
+        )
+        try:
+            future.result()
+        except Exception as error:  # pragma: no cover - ROS service failure
+            self._log(
+                'costmap_recovery_failed',
+                action_status='{}:{}'.format(layer, error),
+            )
+            self.get_logger().warning(
+                '{} costmap recovery failed: {}'.format(layer, error)
+            )
+            return
+        self._log('costmap_recovery_complete', action_status=layer)
+        if self.costmap_recovery_pending == 0:
+            # Let at least one fresh obstacle/clearing scan repopulate genuine
+            # surroundings before asking the planners for another segment.
+            self.next_plan_wall_time = max(
+                self.next_plan_wall_time, time.monotonic() + 0.3
+            )
+
+    def _maybe_request_costmap_recovery(self):
+        now = time.monotonic()
+        path_validity_fresh = (
+            self.latest_path_validity_wall_time is not None
+            and now - self.latest_path_validity_wall_time
+            <= self.path_validity_timeout_s
+        )
+        safety_state_fresh = (
+            self.latest_safety_state_wall_time is not None
+            and now - self.latest_safety_state_wall_time
+            <= self.safety_state_timeout_s
+        )
+        cooldown_ready = (
+            self.costmap_recovery_pending == 0
+            and now - self.last_costmap_recovery_wall_time
+            >= self.stuck_costmap_recovery_cooldown_s
+        )
+        if not self.stuck_costmap_recovery_enabled or not (
+            should_request_costmap_recovery(
+                self.consecutive_segment_aborts,
+                self.stuck_costmap_recovery_abort_count,
+                self._vehicle_speed_mps(),
+                self.stuck_costmap_recovery_max_speed_mps,
+                self.latest_path_hard_valid,
+                path_validity_fresh,
+                self.latest_safety_state,
+                safety_state_fresh,
+                cooldown_ready,
+            )
+        ):
+            return False
+
+        ready_clients = [
+            ('local', self.local_costmap_clear_client),
+            ('global', self.global_costmap_clear_client),
+        ]
+        ready_clients = [
+            item for item in ready_clients if item[1].service_is_ready()
+        ]
+        if not ready_clients:
+            self._log(
+                'costmap_recovery_unavailable',
+                action_status='clear_services_not_ready',
+            )
+            return False
+
+        self.last_costmap_recovery_wall_time = now
+        self.costmap_recovery_pending = len(ready_clients)
+        for layer, client in ready_clients:
+            request = ClearCostmapAroundRobot.Request()
+            request.reset_distance = (
+                self.stuck_costmap_recovery_reset_distance_m
+            )
+            future = client.call_async(request)
+            future.add_done_callback(
+                lambda completed, name=layer: self._costmap_recovery_complete(
+                    completed, name
+                )
+            )
+        diagnostic = 'aborts={};distance={:.1f};layers={}'.format(
+            self.consecutive_segment_aborts,
+            self.stuck_costmap_recovery_reset_distance_m,
+            '+'.join(layer for layer, _ in ready_clients),
+        )
+        self._publish_status('clearing_transient_costmap_near_vehicle')
+        self._log('costmap_recovery_requested', action_status=diagnostic)
+        self.get_logger().warning(
+            'Requesting safety-gated costmap recovery: {}'.format(diagnostic)
+        )
+        return True
+
+    def _reset_path_efficiency_retry(self, reset_topology_escape=False):
         self.path_efficiency_retry_count = 0
         self.relaxed_subgoal_yaw_until_wall_time = 0.0
         self.path_efficiency_blocked_until_wall_time = 0.0
         self.path_efficiency_escape_mode = False
         self.active_inefficient_plan_signatures = set()
+        if reset_topology_escape:
+            self.path_efficiency_topology_escape_used = False
 
     def _on_nav2_plan(self, message):
         """Reject a newly published Hybrid path if it contains a large loop."""
@@ -787,6 +1049,51 @@ class FarNav2GuideNode(Node):
             )
             self.get_logger().info(
                 'Following non-looping Smac detour after topology retry: '
+                '{}'.format(diagnostic)
+            )
+            return
+        # Forward-only Ackermann motion can occasionally require a single
+        # wide P-turn.  Do not accept it immediately: first exhaust ordinary
+        # short-goal/yaw retries, then allow at most one path per mission
+        # waypoint inside a second, finite topology envelope.  Nav2 costmaps,
+        # the independent path-validity gate, and raw-LiDAR emergency stop
+        # continue to enforce collision safety while it is followed.
+        if (
+            self.path_efficiency_allow_bounded_topology_escape
+            and can_accept_bounded_topology_escape(
+                assessment,
+                self.path_efficiency_retry_count,
+                self.path_efficiency_topology_escape_after_retries,
+                self.path_efficiency_topology_escape_used,
+                self.path_efficiency_topology_escape_max_length_ratio,
+                self.path_efficiency_topology_escape_max_abs_turn_rad,
+                self.path_efficiency_topology_escape_max_signed_turn_rad,
+            )
+        ):
+            diagnostic = (
+                'reasons={};length={:.2f};reference={:.2f};ratio={:.2f};'
+                'abs_turn_deg={:.1f};signed_turn_deg={:.1f};'
+                'prior_retries={}'
+            ).format(
+                '+'.join(assessment.reasons),
+                assessment.path_length_m,
+                assessment.reference_length_m,
+                assessment.length_ratio,
+                math.degrees(assessment.absolute_turn_rad),
+                math.degrees(assessment.signed_turn_rad),
+                self.path_efficiency_retry_count,
+            )
+            self.path_efficiency_topology_escape_used = True
+            self.path_efficiency_escape_mode = False
+            self.path_efficiency_blocked_until_wall_time = 0.0
+            self._publish_status('smac_bounded_topology_escape_accepted')
+            self._publish_nav2_status('navigating')
+            self._log(
+                'smac_bounded_topology_escape_accepted',
+                action_status=diagnostic,
+            )
+            self.get_logger().warning(
+                'Following one bounded Smac P-turn after ordinary retries: '
                 '{}'.format(diagnostic)
             )
             return
@@ -896,6 +1203,47 @@ class FarNav2GuideNode(Node):
             self._clear_retry_direction()
             return None
         return self.retry_direction_heading_rad
+
+    def _clear_leg_direction(self):
+        self.leg_direction_heading_rad = None
+
+    def _remember_leg_direction(self, guide_path, source):
+        if (
+            not self.leg_direction_continuity_enabled
+            or not guide_path
+            or self.latest_odometry is None
+        ):
+            return
+        position = self.latest_odometry.pose.pose.position
+        heading = nearest_polyline_tangent(
+            guide_path,
+            (float(position.x), float(position.y)),
+        )
+        if heading is None:
+            return
+        self.leg_direction_heading_rad = heading
+        diagnostic = 'source={};heading_deg={:.1f}'.format(
+            source,
+            math.degrees(heading),
+        )
+        self._log('leg_direction_updated', action_status=diagnostic)
+        self.get_logger().info(
+            'Mission-leg direction continuity updated: {}'.format(
+                diagnostic
+            )
+        )
+
+    def _planning_direction_continuity(self, now):
+        retry_heading = self._active_retry_heading(now)
+        preference = select_direction_continuity(
+            retry_heading,
+            self.leg_direction_heading_rad,
+            self.retry_direction_distance_m,
+            self.retry_direction_cost_weight,
+            self.leg_direction_distance_m,
+            self.leg_direction_cost_weight,
+        )
+        return preference
 
     def _clear_failed_corridors(self):
         self.failed_corridors = []
@@ -1093,6 +1441,9 @@ class FarNav2GuideNode(Node):
         self, grid, start, mission_goal, now, failed_paths,
         hard_block_radius_m=0.0,
     ):
+        continuity_heading, continuity_distance, continuity_weight, _ = (
+            self._planning_direction_continuity(now)
+        )
         return plan_online_guide(
             grid,
             start,
@@ -1102,9 +1453,9 @@ class FarNav2GuideNode(Node):
             goal_search_radius_m=self.goal_search_radius_m,
             cost_weight=self.cost_weight,
             maximum_expansions=self.maximum_expansions,
-            continuity_heading_rad=self._active_retry_heading(now),
-            continuity_distance_m=self.retry_direction_distance_m,
-            continuity_cost_weight=self.retry_direction_cost_weight,
+            continuity_heading_rad=continuity_heading,
+            continuity_distance_m=continuity_distance,
+            continuity_cost_weight=continuity_weight,
             failed_corridors=failed_paths,
             failed_corridor_radius_m=self.failed_corridor_radius_m,
             failed_corridor_cost_weight=self.failed_corridor_cost_weight,
@@ -1195,6 +1546,7 @@ class FarNav2GuideNode(Node):
         if (
             self.goal_request_in_flight
             or self.cancel_in_flight
+            or self.costmap_recovery_pending > 0
         ):
             return
         if now < self.next_plan_wall_time or now < self.hold_until_wall_time:
@@ -1553,6 +1905,13 @@ class FarNav2GuideNode(Node):
             self.next_plan_wall_time = time.monotonic() + 0.1
             return
         if status == 4:
+            # Continue the homotopy established by this successful short
+            # action.  Retry continuity is intentionally cleared below, but
+            # mission-leg continuity remains until the waypoint changes.
+            self._remember_leg_direction(
+                completed_guide_path, 'segment_succeeded'
+            )
+            self.consecutive_segment_aborts = 0
             self._reset_path_efficiency_retry()
             self._clear_retry_direction()
             self._clear_failed_corridors()
@@ -1568,7 +1927,9 @@ class FarNav2GuideNode(Node):
             # control). Preserve the corridor tangent before clearing the
             # failed short action so the next online A* retry does not choose
             # the symmetric opposite direction merely due to grid jitter.
+            recovery_requested = False
             if status == 6:
+                self.consecutive_segment_aborts += 1
                 self._remember_retry_direction(
                     completed_guide_path, 'segment_aborted'
                 )
@@ -1577,8 +1938,12 @@ class FarNav2GuideNode(Node):
                     completed_subgoal_xy,
                     'segment_aborted',
                 )
+                recovery_requested = self._maybe_request_costmap_recovery()
+            else:
+                self.consecutive_segment_aborts = 0
             self._publish_status('far_segment_failed_replanning')
-            self.next_plan_wall_time = time.monotonic() + self.retry_delay_s
+            retry_delay = 0.5 if recovery_requested else self.retry_delay_s
+            self.next_plan_wall_time = time.monotonic() + retry_delay
 
     def destroy_node(self):
         if hasattr(self, 'log_stream'):
