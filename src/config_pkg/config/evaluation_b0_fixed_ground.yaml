@@ -1,0 +1,11 @@
+lidar_obstacle_filter_node:
+  ros__parameters:
+    ground_relative_low_obstacles_enabled: false
+    local_ground_enabled: false
+    local_ground_plane_enabled: false
+
+lidar_emergency_stop_node:
+  ros__parameters:
+    ground_relative_low_obstacles_enabled: false
+    local_ground_enabled: false
+    local_ground_plane_enabled: false

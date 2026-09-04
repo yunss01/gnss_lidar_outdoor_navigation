@@ -92,6 +92,33 @@ class NavigationLearningRecorder(Node):
         self.save_sample_files = bool(
             self.get_parameter('save_sample_files').value
         )
+        # A short stationary capture is kept separate from the mission
+        # recorder: it starts only after fresh LiDAR and odometry arrive, then
+        # closes itself after the requested duration.  This lets perception
+        # validation reuse one raw scan across B0/B1/Proposed offline.
+        self.perception_capture_on_start = bool(
+            self.get_parameter('perception_capture_on_start').value
+        )
+        self.perception_capture_duration_s = float(
+            self.get_parameter('perception_capture_duration_s').value
+        )
+        self.perception_capture_root = Path(str(
+            self.get_parameter('perception_capture_output_directory').value
+        )).expanduser()
+        self.perception_capture_label = str(
+            self.get_parameter('perception_capture_label').value
+        ).strip()
+        if self.perception_capture_on_start:
+            if self.perception_capture_duration_s <= 0.0:
+                raise ValueError('perception_capture_duration_s must be positive')
+            if not self.save_sample_files or not self.save_raw_points:
+                raise ValueError(
+                    'perception capture requires save_sample_files and '
+                    'save_raw_points'
+                )
+        self.evaluation_variant = str(
+            self.get_parameter('evaluation_variant').value
+        ).strip()
         self.geometry = BevGeometry(
             x_min_m=float(self.get_parameter('bev_x_min_m').value),
             x_max_m=float(self.get_parameter('bev_x_max_m').value),
@@ -116,6 +143,8 @@ class NavigationLearningRecorder(Node):
         self._dropped_samples = 0
         self._collision_event_count = 0
         self._collision_max_intensity = 0.0
+        self._perception_capture_state = 'waiting'
+        self._perception_capture_deadline = None
 
         queue_size = int(self.get_parameter('writer_queue_size').value)
         self._writer_queue = queue.Queue(maxsize=max(4, queue_size))
@@ -131,17 +160,21 @@ class NavigationLearningRecorder(Node):
         rate = max(0.2, float(self.get_parameter('record_rate_hz').value))
         self.create_timer(1.0 / rate, self._capture)
         self.create_timer(1.0, self._report_writer_errors)
+        if self.enabled and self.perception_capture_on_start:
+            self.create_timer(0.1, self._manage_perception_capture)
         self.get_logger().info(
             'Navigation learning recorder ready: enabled=%s, rate=%.1f Hz, '
-            'BEV=%dx%d, output=%s' % (
+            'BEV=%dx%d, variant=%s, output=%s, perception_capture=%s' % (
                 self.enabled, rate, self.geometry.width,
-                self.geometry.height, self.output_root,
+                self.geometry.height, self.evaluation_variant,
+                self.output_root, self.perception_capture_on_start,
             )
         )
 
     def _declare_parameters(self):
         defaults = {
             'enabled': True,
+            'evaluation_variant': 'proposed',
             'output_directory': '~/terrain_nav_data/learning/raw',
             'record_rate_hz': 5.0,
             'record_only_when_route_active': True,
@@ -150,6 +183,12 @@ class NavigationLearningRecorder(Node):
             'writer_queue_size': 64,
             'save_raw_points': True,
             'save_sample_files': True,
+            'perception_capture_on_start': False,
+            'perception_capture_duration_s': 15.0,
+            'perception_capture_output_directory': (
+                '~/terrain_nav_data/perception_validation/raw'
+            ),
+            'perception_capture_label': '',
             'bev_x_min_m': -10.0,
             'bev_x_max_m': 30.0,
             'bev_y_min_m': -20.0,
@@ -283,6 +322,10 @@ class NavigationLearningRecorder(Node):
             active = self._active_session is not None
         if not self.enabled:
             return
+        # A stationary perception capture has a deliberate lifecycle of its
+        # own and must not be interrupted by a latched idle/ready route state.
+        if self.perception_capture_on_start:
+            return
         if status == 'navigating' and not active:
             self._start_session()
         elif active and status in {
@@ -297,7 +340,11 @@ class NavigationLearningRecorder(Node):
     def _start_session(self):
         now = datetime.now(timezone.utc).astimezone()
         session_name = now.strftime('session_%Y%m%d_%H%M%S_%f')
-        session_path = self.output_root / session_name
+        output_root = (
+            self.perception_capture_root
+            if self.perception_capture_on_start else self.output_root
+        )
+        session_path = output_root / session_name
         with self._lock:
             if self._active_session is not None:
                 return
@@ -315,10 +362,17 @@ class NavigationLearningRecorder(Node):
             'session': session_name,
             'started_at': now.isoformat(),
             'purpose': (
-                'local-navigation policy learning' if self.save_sample_files
-                else 'navigation performance evaluation'
+                'perception validation capture'
+                if self.perception_capture_on_start
+                else (
+                    'local-navigation policy learning'
+                    if self.save_sample_files
+                    else 'navigation performance evaluation'
+                )
             ),
             'control_effect': 'none; subscriber-only recorder',
+            'evaluation_variant': self.evaluation_variant,
+            'perception_capture_label': self.perception_capture_label,
             'route_json': route_json,
             'route_size': route_size,
             'bev': {
@@ -340,6 +394,42 @@ class NavigationLearningRecorder(Node):
         }
         self._writer_queue.put(('start', session_path, metadata))
         self.get_logger().info('Learning session started: %s' % session_path)
+
+    def _manage_perception_capture(self):
+        """Open/close one sensor-ready, non-driving capture session."""
+        if not self.enabled or not self.perception_capture_on_start:
+            return
+        now = time.monotonic()
+        with self._lock:
+            state = self._perception_capture_state
+            cloud_available = self._latest.get('cloud') is not None
+            odom_available = self._latest.get('odom') is not None
+            cloud_age = now - self._latest_wall.get('cloud', -math.inf)
+            odom_age = now - self._latest_wall.get('odom', -math.inf)
+            deadline = self._perception_capture_deadline
+        if state == 'waiting':
+            if (
+                cloud_available and odom_available
+                and cloud_age <= self.maximum_cloud_age
+                and odom_age <= self.maximum_odom_age
+            ):
+                self._start_session()
+                with self._lock:
+                    self._perception_capture_state = 'recording'
+                    self._perception_capture_deadline = (
+                        now + self.perception_capture_duration_s
+                    )
+                self.get_logger().info(
+                    'Perception capture started: label=%s duration=%.1f s' % (
+                        self.perception_capture_label or 'unlabelled',
+                        self.perception_capture_duration_s,
+                    )
+                )
+        elif state == 'recording' and deadline is not None and now >= deadline:
+            self._close_session('perception_capture_completed')
+            with self._lock:
+                self._perception_capture_state = 'completed'
+            self.get_logger().info('Perception capture completed')
 
     def _close_session(self, result):
         with self._lock:

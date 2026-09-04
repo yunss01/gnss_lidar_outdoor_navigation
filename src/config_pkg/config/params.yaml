@@ -98,6 +98,14 @@ navigation_learning_recorder_node:
     # only when collecting BEV tensors for future imitation learning.
     save_sample_files: false
     save_raw_points: false
+    # A separate, stationary raw-LiDAR capture for perception validation.
+    # The launch argument `perception_capture:=true` overrides the two save
+    # flags above, waits for fresh sensors, records for the chosen duration,
+    # and writes outside the frozen mission-evaluation directory.
+    perception_capture_on_start: false
+    perception_capture_duration_s: 15.0
+    perception_capture_output_directory: ~/terrain_nav_data/perception_validation/raw
+    perception_capture_label: ''
     # Vehicle-centric BEV: x forward, y left. Row 0 is the far-forward edge.
     bev_x_min_m: -10.0
     bev_x_max_m: 30.0

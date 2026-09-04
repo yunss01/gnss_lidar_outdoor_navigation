@@ -4,6 +4,7 @@
 import argparse
 import csv
 from datetime import datetime
+import json
 from pathlib import Path
 
 from .navigation_evaluation_core import (
@@ -29,6 +30,17 @@ def _read_csv(path):
         return []
     with path.open(newline='', encoding='utf-8') as stream:
         return list(csv.DictReader(stream))
+
+
+def _declared_evaluation_variant(session_path):
+    metadata_path = Path(session_path) / 'metadata.json'
+    try:
+        metadata = json.loads(
+            metadata_path.read_text(encoding='utf-8')
+        )
+    except (OSError, ValueError):
+        return ''
+    return str(metadata.get('evaluation_variant', '')).strip()
 
 
 def _format(value):
@@ -113,6 +125,24 @@ def main():
                 seen.add(path.name)
         if not unique:
             parser.error('no new sessions selected; use --latest N or --session PATH')
+        declared = [
+            (path.name, _declared_evaluation_variant(path))
+            for path in unique
+        ]
+        mismatches = [
+            (session, variant) for session, variant in declared
+            if variant and variant != args.variant
+        ]
+        if mismatches:
+            details = ', '.join(
+                '{} declares {}'.format(session, declared)
+                for session, declared in mismatches
+            )
+            parser.error(
+                'requested variant {} does not match recorder metadata: {}'.format(
+                    args.variant, details
+                )
+            )
         added = [
             evaluate_session(path, args.variant, args.scenario)
             for path in unique

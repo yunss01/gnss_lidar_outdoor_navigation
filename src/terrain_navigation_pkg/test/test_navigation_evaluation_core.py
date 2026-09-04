@@ -1,11 +1,24 @@
 import csv
 import json
 
+from terrain_navigation_pkg.evaluate_navigation_runs import (
+    _declared_evaluation_variant,
+)
 from terrain_navigation_pkg.navigation_evaluation_core import (
     evaluate_session,
     mission_polyline_length,
     summarize_runs,
 )
+
+
+def test_recorder_variant_can_be_checked_before_registration(tmp_path):
+    session = tmp_path / 'session_20260831_120000_000000'
+    session.mkdir()
+    (session / 'metadata.json').write_text(json.dumps({
+        'evaluation_variant': 'b0_fixed_ground',
+    }))
+
+    assert _declared_evaluation_variant(session) == 'b0_fixed_ground'
 
 
 def test_mission_polyline_length_uses_gnss_waypoints():

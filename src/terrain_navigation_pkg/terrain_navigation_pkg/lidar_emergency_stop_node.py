@@ -164,6 +164,7 @@ class LidarEmergencyStopNode(Node):
         self.declare_parameter('local_ground_resolution_m', 0.75)
         self.declare_parameter('local_ground_radius_m', 1.50)
         self.declare_parameter('local_ground_quantile', 0.25)
+        self.declare_parameter('local_ground_plane_enabled', True)
         self.declare_parameter('minimum_obstacle_points', 20)
         self.declare_parameter('clear_required_scans', 3)
         self.declare_parameter('use_commanded_trajectory', True)
@@ -266,6 +267,9 @@ class LidarEmergencyStopNode(Node):
             ).value),
             'local_ground_quantile': float(self.get_parameter(
                 'local_ground_quantile'
+            ).value),
+            'local_ground_plane_enabled': bool(self.get_parameter(
+                'local_ground_plane_enabled'
             ).value),
         }
         # ``latest_points`` is already height-filtered by

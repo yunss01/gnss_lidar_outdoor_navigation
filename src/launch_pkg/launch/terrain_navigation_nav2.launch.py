@@ -1,7 +1,12 @@
 """Preview or drive mapless outdoor navigation with Nav2 and 3D LiDAR."""
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import (
+    DeclareLaunchArgument,
+    LogInfo,
+    OpaqueFunction,
+    SetLaunchConfiguration,
+)
 from launch.conditions import IfCondition
 from launch.substitutions import (
     LaunchConfiguration,
@@ -11,6 +16,30 @@ from launch.substitutions import (
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+
+
+EVALUATION_PROFILES = {
+    'proposed': 'evaluation_proposed.yaml',
+    'b0_fixed_ground': 'evaluation_b0_fixed_ground.yaml',
+    'b1_plane_ground': 'evaluation_b1_plane_ground.yaml',
+}
+
+
+def _select_evaluation_profile(context):
+    variant = LaunchConfiguration('evaluation_variant').perform(context)
+    profile = EVALUATION_PROFILES.get(variant)
+    if profile is None:
+        raise RuntimeError(
+            'evaluation_variant must be one of: {}'.format(
+                ', '.join(EVALUATION_PROFILES)
+            )
+        )
+    return [
+        SetLaunchConfiguration('evaluation_profile_file', profile),
+        LogInfo(msg='ICCE evaluation variant: {} ({})'.format(
+            variant, profile
+        )),
+    ]
 
 
 def generate_launch_description():
@@ -24,6 +53,11 @@ def generate_launch_description():
         config_share,
         'config',
         'nav2_outdoor_params.yaml',
+    ])
+    evaluation_parameters = PathJoinSubstitution([
+        config_share,
+        'config',
+        LaunchConfiguration('evaluation_profile_file'),
     ])
     rolling_behavior_tree = PathJoinSubstitution([
         config_share,
@@ -87,6 +121,38 @@ def generate_launch_description():
                 'while F9/F10 is active'
             ),
         ),
+        DeclareLaunchArgument(
+            'perception_capture',
+            default_value='false',
+            description=(
+                'Record one stationary raw-LiDAR/costmap capture without '
+                'starting F9/F10, then close it automatically.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'perception_capture_duration_s',
+            default_value='15.0',
+            description='Duration of the stationary perception capture.',
+        ),
+        DeclareLaunchArgument(
+            'perception_capture_label',
+            default_value='',
+            description='Short scene label stored in capture metadata.',
+        ),
+        DeclareLaunchArgument(
+            'perception_capture_output_directory',
+            default_value='~/terrain_nav_data/perception_validation/raw',
+            description='Directory for stationary perception captures.',
+        ),
+        DeclareLaunchArgument(
+            'evaluation_variant',
+            default_value='proposed',
+            description=(
+                'Ground-processing profile: proposed, b0_fixed_ground, or '
+                'b1_plane_ground'
+            ),
+        ),
+        OpaqueFunction(function=_select_evaluation_profile),
         Node(
             package='terrain_navigation_pkg',
             executable='gnss_goal_manager_node',
@@ -140,7 +206,7 @@ def generate_launch_description():
             executable='lidar_obstacle_filter_node',
             name='lidar_obstacle_filter_node',
             output='screen',
-            parameters=[common_parameters],
+            parameters=[common_parameters, evaluation_parameters],
         ),
         Node(
             package='terrain_navigation_pkg',
@@ -281,6 +347,7 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 common_parameters,
+                evaluation_parameters,
                 {
                     'input_command_topic': '/cmd_vel_path_validated',
                     'output_command_topic': '/cmd_vel',
@@ -319,7 +386,38 @@ def generate_launch_description():
             executable='navigation_learning_recorder_node',
             name='navigation_learning_recorder_node',
             output='screen',
-            parameters=[common_parameters],
+            parameters=[
+                common_parameters,
+                {
+                    'evaluation_variant': LaunchConfiguration(
+                        'evaluation_variant'
+                    ),
+                    'perception_capture_on_start': ParameterValue(
+                        LaunchConfiguration('perception_capture'),
+                        value_type=bool,
+                    ),
+                    'perception_capture_duration_s': ParameterValue(
+                        LaunchConfiguration('perception_capture_duration_s'),
+                        value_type=float,
+                    ),
+                    'perception_capture_label': LaunchConfiguration(
+                        'perception_capture_label'
+                    ),
+                    'perception_capture_output_directory': LaunchConfiguration(
+                        'perception_capture_output_directory'
+                    ),
+                    # Keep normal F9/F10 evaluation lightweight.  Capture
+                    # mode alone saves the raw cloud and BEV/costmap arrays.
+                    'save_sample_files': ParameterValue(
+                        LaunchConfiguration('perception_capture'),
+                        value_type=bool,
+                    ),
+                    'save_raw_points': ParameterValue(
+                        LaunchConfiguration('perception_capture'),
+                        value_type=bool,
+                    ),
+                },
+            ],
             condition=IfCondition(
                 LaunchConfiguration('record_learning_data')
             ),
